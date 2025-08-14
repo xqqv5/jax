@@ -75,7 +75,7 @@ jobs:
           runner: ["linux-x86-n4-64", "linux-arm64-t2a-48"]
           python: ["3.11", "3.12", "3.13", "3.13-nogil", "3.14", "3.14-nogil"]
           enable-x64: [0]
-    name: "Bazel CPU tests with ${{ format('{0}', 'build_jaxlib=false') }}"
+    name: "Bazel CPU tests with ${{ format('{0}', 'build_jaxlib=false') }} (${{ matrix.runner }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
@@ -84,6 +84,8 @@ jobs:
       halt-for-connection: ${{inputs.halt-for-connection}}
       build_jaxlib: "false"
       build_jax: "false"
+      run-backend_independent-test-suite: "1"
+      clone_main_xla: 0
 
   run-pytest-cuda:
     uses: ./.github/workflows/pytest_cuda.yml
@@ -147,7 +149,7 @@ jobs:
           python: ["3.11", "3.12", "3.13", "3.13-nogil", "3.14", "3.14-nogil"]
           cuda-version: [12, 13]
           enable-x64: [0]
-    name: "Bazel CUDA Non-RBE with ${{ format('{0}', 'build_jaxlib=false') }}"
+    name: "Bazel CUDA Non-RBE with ${{ format('{0}', 'build_jaxlib=false') }} (${{ matrix.runner }})"
     with:
       runner: ${{ matrix.runner }}
       python: ${{ matrix.python }}
@@ -159,6 +161,8 @@ jobs:
       build_jax: "false"
       jaxlib-version: "head"
       write_to_bazel_remote_cache: 1
+      run-backend_independent-test-suite: 1
+      clone_main_xla: 0
       run_multiaccelerator_tests: "true"
 
   run-pytest-tpu:
@@ -240,7 +244,7 @@ jobs:
                 type: "v5e-8"
               python: "3.12"
 
-    name: "Bazel tests TPU (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }})"
+    name: "Bazel tests TPU (JAX artifacts version = ${{ startsWith(github.ref_name, 'release/') && 'latest release' || 'nightly' }}, ${{ matrix.runner }})"
     with:
       runner: ${{ matrix.tpu-specs.runner }}
       cores: ${{ matrix.tpu-specs.cores }}
