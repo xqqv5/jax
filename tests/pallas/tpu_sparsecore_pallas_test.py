@@ -850,6 +850,37 @@ class VectorSubcoreTest(PallasSCTest):
     x = jnp.arange(math.prod(shape), dtype=dtype).reshape(shape)
     np.testing.assert_array_equal(kernel(x), x)
 
+  @parameterized.product(dtype=[jnp.int32, jnp.float32])
+  def test_cumsum(self, dtype):
+    x = jnp.arange(sc_core._vector_dimension(), dtype=dtype)
+
+    @vector_subcore_kernel(out_shape=x)
+    def kernel(x_ref, o_ref):
+      o_ref[...] = jnp.cumsum(x_ref[...])
+
+    np.testing.assert_array_equal(kernel(x), np.cumsum(x))
+
+  @parameterized.product(dtype=[jnp.int32, jnp.float32])
+  def test_cumsum_2d_not_supported(self, dtype):
+    x = jnp.arange(sc_core._vector_dimension(), dtype=dtype)
+
+    with self.assertRaisesRegex(NotImplementedError, r"must be rank 1"):
+      @vector_subcore_kernel(out_shape=x)
+      def kernel(x_ref, o_ref):
+        o_ref[...] = jnp.cumsum(x_ref[...].reshape(4, 2), axis=0).reshape(-1)
+
+      kernel(x)
+
+  @parameterized.product(dtype=[jnp.int32, jnp.float32])
+  def test_masked_cumsum(self, dtype):
+    x = jnp.arange(sc_core._vector_dimension(), dtype=dtype)
+
+    @vector_subcore_kernel(out_shape=x)
+    def kernel(x_ref, o_ref):
+      o_ref[...] = plsc.masked_cumsum(x_ref[...], mask=(x_ref[...] % 2) == 1)
+
+    np.testing.assert_array_equal(kernel(x), np.cumsum(x * (x % 2)))
+
   def test_parallel_loop_with_carry(self):
     chunk_size = sc_core._vector_dimension()
     nchunks = 4
@@ -907,6 +938,34 @@ class VectorSubcoreTest(PallasSCTest):
           x_ref[...] = o_ref[...]
 
       kernel(x)
+
+  def test_enqueue_dma_add(self):
+    mesh = plsc.VectorSubcoreMesh(
+        core_axis_name="core", subcore_axis_name="subcore", num_cores=1
+    )
+    shape = (mesh.num_subcores, 8, 32)
+    x = jnp.arange(np.prod(shape), dtype=jnp.int32).reshape(*shape)
+
+    @plsc.kernel(
+        out_shape=x,
+        mesh=mesh,
+        scratch_shapes=(
+            pltpu.SemaphoreType.DMA,
+            pltpu.VMEM(shape[1:], jnp.int32),
+        ),
+    )
+    def kernel(x_ref, o_ref, sem_ref, scratch_ref):
+      subcore_id = lax.axis_index("subcore")
+      pltpu.sync_copy(x_ref.at[subcore_id], scratch_ref)
+      pltpu.sync_copy(scratch_ref, o_ref.at[subcore_id])
+      pltpu.async_copy(
+          scratch_ref,
+          o_ref.at[subcore_id],
+          sem_ref,
+          add=True,
+      ).wait()
+
+    np.testing.assert_array_equal(kernel(x), x + x)
 
 
 class ScalarSubcoreTest(PallasSCTest):
