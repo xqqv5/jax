@@ -87,11 +87,13 @@ class VectorLayoutInferer {
  public:
   explicit VectorLayoutInferer(int hardware_generation,
                                std::array<int64_t, 2> target_shape,
-                               const TpuTilingFlags &tpu_tiling_flags)
+                               const TpuTilingFlags& tpu_tiling_flags,
+                               bool consistent_numerics)
       : hardware_generation_(hardware_generation),
         target_shape_({target_shape[0], target_shape[1]}),
         default_tiling_(target_shape),
-        tpu_tiling_flags_(tpu_tiling_flags) {}
+        tpu_tiling_flags_(tpu_tiling_flags),
+        consistent_numerics_(consistent_numerics) {}
 
 #define TPU_CHECK_OP(cond, msg) \
   if (!(cond)) {                \
@@ -1471,6 +1473,19 @@ class VectorLayoutInferer {
         out_offsets[i] = std::nullopt;
       }
     }
+    // When consistent numerics is enabled, don't assign replicated offsets to
+    // the reduction dimensions for the source layout. This is because we want
+    // to guarantee more consistent numerics by disabling some optimizations
+    // in apply-vector-layout pass which may change the numerics.
+    if (consistent_numerics_) {
+      src_layout =
+          VectorLayout(src_layout.bitwidth(),
+                       {reduces[0] ? src_layout.offsets()[0].value_or(0)
+                                   : src_layout.offsets()[0],
+                        reduces[1] ? src_layout.offsets()[1].value_or(0)
+                                   : src_layout.offsets()[1]},
+                       src_layout.tiling(), src_layout.implicit_dim());
+    }
     setLayout(op, {src_layout, acc_layout},
               VectorLayout(src_layout.bitwidth(), out_offsets,
                            src_layout.tiling(), out_implicit_dim));
@@ -2276,6 +2291,7 @@ class VectorLayoutInferer {
   std::array<int64_t, 2> target_shape_;
   std::array<int64_t, 2> default_tiling_;
   TpuTilingFlags tpu_tiling_flags_;
+  bool consistent_numerics_;
 
   // TODO(b/342235360): Deprecate force_first_tile_offsets_ once we fully
   // remove the restriction that offsets must fall within the first tile.
@@ -2290,11 +2306,13 @@ struct InferVectorLayoutPass
     : public impl::InferVectorLayoutPassBase<InferVectorLayoutPass> {
   InferVectorLayoutPass(int hardware_generation,
                         std::array<int64_t, 2> target_shape,
-                        TpuTilingFlags tpu_tiling_flags) {
+                        TpuTilingFlags tpu_tiling_flags,
+                        bool consistent_numerics) {
     this->hardware_generation = hardware_generation;
     this->sublane_count = target_shape[0];
     this->lane_count = target_shape[1];
     this->tpu_tiling_flags = tpu_tiling_flags;
+    this->consistent_numerics = consistent_numerics;
   }
   void runOnOperation() override {
     // Fail if hardware_generation has not been set from the default value.
@@ -2305,7 +2323,7 @@ struct InferVectorLayoutPass
     }
     func::FuncOp func = getOperation();
     VectorLayoutInferer run(hardware_generation, {sublane_count, lane_count},
-                            tpu_tiling_flags);
+                            tpu_tiling_flags, consistent_numerics);
     if (run.infer(func).failed()) {
       signalPassFailure();
     }
@@ -2318,9 +2336,9 @@ struct InferVectorLayoutPass
 
 std::unique_ptr<OperationPass<func::FuncOp>> createInferVectorLayoutPass(
     int hardware_generation, std::array<int64_t, 2> target_shape,
-    const TpuTilingFlags &tpu_tiling_flags) {
+    const TpuTilingFlags& tpu_tiling_flags, bool consistent_numerics) {
   return std::make_unique<InferVectorLayoutPass>(
-      hardware_generation, target_shape, tpu_tiling_flags);
+      hardware_generation, target_shape, tpu_tiling_flags, consistent_numerics);
 }
 
 }  // namespace mlir::tpu

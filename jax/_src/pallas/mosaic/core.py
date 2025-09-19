@@ -105,6 +105,7 @@ class CompilerParams(pallas_core.CompilerParams):
   disable_bounds_checks: bool = False
   skip_device_barrier: bool = False
   allow_collective_id_without_custom_barrier: bool = False
+  consistent_numerics: bool = False
 
   def __init__(
       self,
@@ -120,6 +121,7 @@ class CompilerParams(pallas_core.CompilerParams):
       disable_bounds_checks: bool = False,
       skip_device_barrier: bool = False,
       allow_collective_id_without_custom_barrier: bool = False,
+      consistent_numerics: bool = False,
   ):
     object.__setattr__(
         self,
@@ -149,6 +151,7 @@ class CompilerParams(pallas_core.CompilerParams):
         "allow_collective_id_without_custom_barrier",
         allow_collective_id_without_custom_barrier,
     )
+    object.__setattr__(self, "consistent_numerics", consistent_numerics)
 
   # Replace is a method, not a field.
   replace = dataclasses.replace
