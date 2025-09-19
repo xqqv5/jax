@@ -26,11 +26,13 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Casting.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -129,6 +131,204 @@ class CanonicalBuilder : public ImplicitLocOpBuilder {
   const CanonicalizeContext &ctx_;
   Operation *op_;
 };
+
+// Ensures both lhs and rhs have contiguous non-contracting and contracting
+// dimensions by inserting transposes if needed. Returns lhs, rhs, and new
+// dimension numbers if a transpose was inserted, otherwise returns
+// std::nullopt.
+std::optional<std::tuple<TypedValue<VectorType>, TypedValue<VectorType>,
+                         DotDimensionNumbersAttr>>
+ensure_matmul_contiguous_dims(
+    CanonicalBuilder& builder, TypedValue<VectorType> lhs,
+    TypedValue<VectorType> rhs,
+    const DotDimensionNumbersAttr& dimension_numbers) {
+  // Returns a tuple of [new_operand, new_non_contracting_dims,
+  // new_contracting_dims]. new_operand is nullptr if no transpose is inserted.
+  auto maybe_insert_transpose =
+      [&](TypedValue<VectorType> operand, ArrayRef<int64_t> batch_dims,
+          ArrayRef<int64_t> non_contracting_dims,
+          ArrayRef<int64_t> contracting_dims, bool is_lhs)
+      -> std::tuple<TypedValue<VectorType>, SmallVector<int64_t, 2>,
+                    SmallVector<int64_t, 2>> {
+    // Do nothing if batch_dims are not in the front.
+    // TODO(yueshengys): support batch_dims in the middle.
+    if (batch_dims != ArrayRef<int64_t>(llvm::to_vector(
+                          llvm::seq<int64_t>(0, batch_dims.size())))) {
+      return {nullptr, llvm::to_vector(non_contracting_dims),
+              llvm::to_vector(contracting_dims)};
+    }
+
+    VectorType vty = operand.getType();
+    auto shape = vty.getShape();
+    auto rank = shape.size();
+
+    // Currently we only support one contracting dim and already-sorted
+    // non-contracting dims.
+    // TODO(yueshengys): support more cases, e.g., multiple contracting dims,
+    // non-contracting dims not sorted, etc.
+    CHECK(llvm::is_sorted(non_contracting_dims))
+        << "Non-contracting dims are not sorted.";
+    CHECK(contracting_dims.size() == 1) << "Contracting dims size must be 1.";
+
+    auto is_identity = [&](absl::Span<const int64_t> perm) {
+      for (int i = 0; i < rank; ++i) {
+        if (perm[i] != i) return false;
+      }
+      return true;
+    };
+
+    SmallVector<int64_t, 2> perm_A;
+    perm_A.insert(perm_A.end(), batch_dims.begin(), batch_dims.end());
+    perm_A.insert(perm_A.end(), non_contracting_dims.begin(),
+                  non_contracting_dims.end());
+    perm_A.insert(perm_A.end(), contracting_dims.begin(),
+                  contracting_dims.end());
+    if (is_identity(perm_A)) {
+      return {nullptr, llvm::to_vector(non_contracting_dims),
+              llvm::to_vector(
+                  contracting_dims)};  // Already in [B..., NC..., C...].
+    }
+
+    SmallVector<int64_t, 2> perm_B;
+    perm_B.insert(perm_B.end(), batch_dims.begin(), batch_dims.end());
+    perm_B.insert(perm_B.end(), contracting_dims.begin(),
+                  contracting_dims.end());
+    perm_B.insert(perm_B.end(), non_contracting_dims.begin(),
+                  non_contracting_dims.end());
+    if (is_identity(perm_B)) {
+      return {nullptr, llvm::to_vector(non_contracting_dims),
+              llvm::to_vector(
+                  contracting_dims)};  // Already in [B..., C..., NC...].
+    }
+
+    // Transpose is needed. Force lhs to be in [B..., NC..., C...] and rhs to
+    // be in [B..., C..., NC...]. For lhs, we handle a special case where it is
+    // a result of a previous TransposeOp by composing the two transpose
+    // operations.
+    const SmallVector<int64_t, 2> perm = is_lhs ? perm_A : perm_B;
+    Value source = operand;
+    SmallVector<int64_t, 2> effective_perm = perm;
+
+    // Check if the operand is a result of a TransposeOp
+    auto prev_transpose_op = operand.getDefiningOp<tpu::TransposeOp>();
+    if (is_lhs && prev_transpose_op) {
+      source = prev_transpose_op.getOperand();
+      ArrayRef<int64_t> prev_perm = prev_transpose_op.getPermutation();
+      SmallVector<int64_t, 2> composed_perm;
+      for (int i = 0; i < perm.size(); ++i) {
+        composed_perm.push_back(prev_perm[perm[i]]);
+      }
+      effective_perm = composed_perm;
+    }
+
+    auto source_shape =
+        llvm::cast<mlir::VectorType>(source.getType()).getShape();
+    SmallVector<int64_t, 2> new_shape;
+    for (int64_t old_idx : effective_perm) {
+      new_shape.push_back(source_shape[old_idx]);
+    }
+    auto new_operand_type = VectorType::get(new_shape, vty.getElementType());
+    auto transpose_op = builder.create<tpu::TransposeOp>(
+        new_operand_type, source, effective_perm);
+    TypedValue<VectorType> new_operand =
+        cast<TypedValue<VectorType>>(transpose_op);
+
+    // Compute inverse permutation (old_index -> new_index)
+    SmallVector<int64_t, 2> inverse_perm(rank);
+    for (int i = 0; i < rank; ++i) {
+      inverse_perm[perm[i]] = i;
+    }
+
+    // Helper to apply an inverse permutation to a list of dimension indices
+    auto map_dims = [&](ArrayRef<int64_t> dims) {
+      SmallVector<int64_t, 2> new_dims;
+      for (int64_t dim : dims) {
+        new_dims.push_back(inverse_perm[dim]);
+      }
+      return new_dims;
+    };
+
+    // Map the dimension indices to the new dimension order.
+    SmallVector<int64_t, 2> new_c = map_dims(contracting_dims);
+    SmallVector<int64_t, 2> new_nc = map_dims(non_contracting_dims);
+
+    return {new_operand, new_nc, new_c};
+  };
+
+  auto [new_lhs, new_lhs_non_contracting_dims, new_lhs_contracting_dims] =
+      maybe_insert_transpose(lhs, dimension_numbers.getLhsBatchDims(),
+                             dimension_numbers.getLhsNonContractingDims(),
+                             dimension_numbers.getLhsContractingDims(),
+                             /*is_lhs=*/true);
+  auto [new_rhs, new_rhs_non_contracting_dims, new_rhs_contracting_dims] =
+      maybe_insert_transpose(rhs, dimension_numbers.getRhsBatchDims(),
+                             dimension_numbers.getRhsNonContractingDims(),
+                             dimension_numbers.getRhsContractingDims(),
+                             /*is_lhs=*/false);
+  if (!new_lhs && !new_rhs) {
+    return std::nullopt;
+  }
+
+  SmallVector<int64_t, 2> new_output_dim_order;
+  for (int64_t batch_dim : dimension_numbers.getLhsBatchDims()) {
+    new_output_dim_order.push_back(0);
+    new_output_dim_order.push_back(batch_dim);
+  }
+  for (int64_t non_contracting_dim : new_lhs_non_contracting_dims) {
+    new_output_dim_order.push_back(0);
+    new_output_dim_order.push_back(non_contracting_dim);
+  }
+  for (int64_t non_contracting_dim : new_rhs_non_contracting_dims) {
+    new_output_dim_order.push_back(1);
+    new_output_dim_order.push_back(non_contracting_dim);
+  }
+
+  // Check that the new output shape is the same as the original out shape.
+  auto get_output_shape =
+      [&](ArrayRef<int64_t> output_dim_order, TypedValue<VectorType> lhs,
+          TypedValue<VectorType> rhs) -> SmallVector<int64_t, 2> {
+    SmallVector<int64_t, 2> shape;
+    auto lhs_shape = lhs.getType().getShape();
+    auto rhs_shape = rhs.getType().getShape();
+
+    // The output dim order is of the form [0, batch_dim_0, 0, batch_dim_1,...,
+    // 0, lhs_nc_dim_0, 0, lhs_nc_dim_1,..., 1, rhs_nc_dim_0, 1,
+    // rhs_nc_dim_1,...,]
+    for (int i = 0; i < output_dim_order.size(); i += 2) {
+      int64_t op_idx = output_dim_order[i];
+      int64_t dim_idx = output_dim_order[i + 1];
+      if (op_idx == 0) {
+        CHECK(dim_idx >= 0 && dim_idx < lhs_shape.size());
+        shape.push_back(lhs_shape[dim_idx]);
+      } else {
+        CHECK_EQ(op_idx, 1);
+        CHECK(dim_idx >= 0 && dim_idx < rhs_shape.size());
+        shape.push_back(rhs_shape[dim_idx]);
+      }
+    }
+    return shape;
+  };
+
+  // Shape from original attributes and original tensors
+  SmallVector<int64_t> old_expected_shape =
+      get_output_shape(dimension_numbers.getOutputDimOrder(), lhs, rhs);
+
+  // Shape from new attributes and potentially new tensors
+  auto final_lhs = new_lhs ? new_lhs : lhs;
+  auto final_rhs = new_rhs ? new_rhs : rhs;
+  SmallVector<int64_t> new_expected_shape =
+      get_output_shape(new_output_dim_order, final_lhs, final_rhs);
+
+  CHECK(old_expected_shape == new_expected_shape) << "Output shape mismatch.";
+
+  DotDimensionNumbersAttr new_dimension_numbers = DotDimensionNumbersAttr::get(
+      builder.getContext(), new_lhs_contracting_dims, new_rhs_contracting_dims,
+      new_lhs_non_contracting_dims, new_rhs_non_contracting_dims,
+      new_output_dim_order, dimension_numbers.getLhsBatchDims(),
+      dimension_numbers.getRhsBatchDims());
+
+  return std::make_tuple(final_lhs, final_rhs, new_dimension_numbers);
+}
 
 // Returns the collapsed lhs, rhs, acc and the new dimension numbers if the
 // non-contracting dims can be collapsed, otherwise returns std::nullopt.
@@ -320,6 +520,13 @@ FailureOr<Value> canonicalize_matmul(const CanonicalizeContext &ctx,
       // Dot dim API - dimensions are provided and are not default
       (op.getDimensionNumbers().value() !=
        defaultDimensionNumbers(builder, false, false))) {
+    if (auto transposed_operands = ensure_matmul_contiguous_dims(
+            builder, lhs, rhs, *op.getDimensionNumbers())) {
+      DotDimensionNumbersAttr new_dimension_numbers;
+      std::tie(lhs, rhs, new_dimension_numbers) = *transposed_operands;
+      op.setDimensionNumbersAttr(new_dimension_numbers);
+    }
+
     if (auto collapsed_operands_and_ddn = collapse_matmul_non_contracting_dims(
             builder, lhs, rhs, acc, *op.getDimensionNumbers())) {
       tpu::DotDimensionNumbersAttr new_dimension_numbers;
