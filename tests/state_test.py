@@ -1660,7 +1660,7 @@ class PinnedBuffersTest(jtu.JaxTestCase):
     txt = f.lower(x).as_text('hlo')
     self.assertIn("Pin", txt)
 
-    if jtu.test_device_matches(['gpu']):
+    if jtu.test_device_matches(['gpu', 'tpu']):
       y = f(x)
       self.assertAllClose(y, x)
 
