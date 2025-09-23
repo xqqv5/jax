@@ -457,15 +457,19 @@ def _vector_load_op_lowering_rule(
         f"{vector_load_op} has an unsupported layout: {out_layout_attr}"
     )
 
-  optimized = vector_load_op.attributes["optimized"].value
+  optimized = (
+      vector_load_op.attributes["optimized"].value
+      if "optimized" in vector_load_op.attributes
+      else None
+  )
   layout = layouts.from_tiled_layout_attr(out_layout_attr)
   ref_ty = ir.MemRefType(vector_load_op.base.type)
   if ref_ty.memory_space is None:  # GMEM
     fragmented_array = fa.FragmentedArray.load_untiled(
         vector_load_op.base,
         layout=layout,
-        optimized=optimized,
         is_signed=is_signed,
+        optimized=optimized if optimized is not None else False,
     )
     return [_fragmented_array_to_ir(fragmented_array)]
 
@@ -487,13 +491,14 @@ def _vector_load_op_lowering_rule(
         swizzle=swizzle,
         is_signed=is_signed,
         layout=layout,
+        optimized=optimized if optimized is not None else True,
     )
   else:
     fragmented_array = fa.FragmentedArray.load_untiled(
         vector_load_op.base,
         layout=layout,
-        optimized=optimized,
         is_signed=is_signed,
+        optimized=optimized if optimized is not None else False,
     )
 
   return [_fragmented_array_to_ir(fragmented_array)]
@@ -525,10 +530,16 @@ def _vector_store_op_lowering_rule(
 
   ref = vector_store_op.base
   ref_type = ir.MemRefType(ref.type)
-  optimized = vector_store_op.attributes["optimized"].value
+  optimized = (
+      vector_store_op.attributes["optimized"].value
+      if "optimized" in vector_store_op.attributes
+      else None
+  )
 
   if ref_type.memory_space is None:  # GMEM
-    fragmented_array.store_untiled(ref, optimized=optimized)
+    fragmented_array.store_untiled(
+        ref, optimized=optimized if optimized is not None else False
+    )
   elif ref_type.memory_space == utils.smem():
     transforms_attr = inference_utils.in_transforms(vector_store_op)[0]
     swizzle, transforms = swizzle_and_transforms_from_transforms_attr(
@@ -538,9 +549,15 @@ def _vector_store_op_lowering_rule(
     if has_transforms:
       _check_transforms_and_swizzle_are_supported(ref_type, transforms, swizzle)
       unwrapped_ref = unwrap_transformed_memref(ref, transforms_attr)
-      fragmented_array.store_tiled(unwrapped_ref, swizzle)
+      fragmented_array.store_tiled(
+          unwrapped_ref,
+          swizzle,
+          optimized=optimized if optimized is not None else True,
+      )
     else:
-      fragmented_array.store_untiled(ref, optimized=optimized)
+      fragmented_array.store_untiled(
+          ref, optimized=optimized if optimized is not None else False
+      )
   else:
     raise ValueError(f"Unsupported memory space: {ref_type.memory_space}")
 
