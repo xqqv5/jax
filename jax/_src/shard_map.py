@@ -1907,40 +1907,67 @@ def pmap(f, axis_name=None, *, in_axes=0, out_axes=0,
   if isinstance(axis_name, core._TempAxisName):
     axis_name = repr(axis_name)
 
-  def infer_params(*args, __check=True, **kwargs):
+  def infer_params(*args, **kwargs):
     p = _prepare_pmap(f, in_axes, out_axes, static_broadcasted_tuple,
                       donate_tuple, devices, backend, axis_size, args, kwargs)
-    if __check:
-      for arg in p.flat_args:
-        dispatch.check_arg(arg)
+    for arg in p.flat_args:
+      if isinstance(arg, core.ShapedArray): continue
+      dispatch.check_arg(arg)
     mesh = Mesh(_get_devices(p, backend), (axis_name,))
     _pmapped, in_specs, out_specs = _cached_shard_map(
         p.flat_fun, mesh, p.in_axes_flat, p.out_axes_thunk, axis_name)
     jitted_f = api.jit(
         _pmapped,
         donate_argnums=[i for i, val in enumerate(p.donated_invars) if val])
-    if __check or xb.process_count() > 1:
+    if xb.process_count() > 1:
       flat_global_args = mhu.host_local_array_to_global_array(
           p.flat_args, mesh, list(in_specs))
     else:
       flat_global_args = p.flat_args
-    return jitted_f, flat_global_args, p.out_tree, mesh, out_specs
+    return jitted_f, flat_global_args, p, mesh, out_specs
 
   def wrapped(*args, **kwargs):
-    (jitted_f, flat_global_args, out_tree, mesh,
+    (jitted_f, flat_global_args, p, mesh,
      out_specs) = infer_params(*args, **kwargs)
     outs = jitted_f(*flat_global_args)
     if xb.process_count() > 1:
       outs = mhu.global_array_to_host_local_array(outs, mesh, out_specs())
-    return tree_unflatten(out_tree(), outs)
+    return tree_unflatten(p.out_tree(), outs)
 
   def lower(*args, **kwargs):
-    jitted_f, _, out_tree, _, _ = infer_params(*args, __check=False, **kwargs)
-    lowered = jitted_f.lower(*args, **kwargs)
-    lowered = stages.Lowered(lowered._lowering, lowered.args_info, out_tree(),
+    jitted_f, flat_global_args, p, _, _ = infer_params(*args, **kwargs)
+    traced = jitted_f.trace(*flat_global_args)
+
+    # NOTE(dsuo): However, use in_tree / donated args from the original pmap to
+    # make `ArgsInfo` so the compiled function's signature matches the original
+    # pmap's signature.
+    typeof = lambda x: x if isinstance(x, core.ShapedArray) else core.typeof(x)
+    if args:
+      arg_avals = tree_map(typeof, args)
+    else:
+      arg_avals = tree_map(typeof, flat_global_args)
+    args_info = stages.make_args_info(p.in_tree, arg_avals, p.donated_invars)
+    lowered = traced.lower()
+    lowered = stages.Lowered(lowered._lowering, args_info, p.out_tree(),
                              lowered._no_kwargs)
+
+    # NOTE(dsuo): Is there a better way to identify this function as pmapped?
+    lowered_compile = lowered.compile
+    def compile(*args, **kwargs):
+      compiled = lowered_compile(*args, **kwargs)
+      compiled.pmapped = True
+      return compiled
+    lowered.compile = compile
+    lowered.pmapped = True
     return lowered
+
   wrapped.lower = lower
+
+  # NOTE(dsuo): For code that uses `jax.pmap` and need a new way of
+  # introspecting that a given function is the result of `jax.pmap`. Before,
+  # cpp_pmap would return a `PmapFunction`. We could create a wrapper class that
+  # maintains the `PmapFunction` semantics, but this may be a little messy.
+  wrapped.pmapped = True
   return wrapped
 
 

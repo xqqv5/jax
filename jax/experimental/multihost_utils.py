@@ -355,9 +355,12 @@ def host_local_array_to_global_array(
   in_pspecs = _flatten_pspecs('input pspecs', in_tree,
                               pjit_lib.hashable_pytree(pspecs))
   out_flat = [
-      host_local_array_to_global_array_p.bind(inp, global_mesh=global_mesh,
-                                              pspec=in_spec)
-      for inp, in_spec in safe_zip(flat_inps, in_pspecs)
+      host_local_array_to_global_array_p.bind(
+          inp, global_mesh=global_mesh, pspec=in_spec
+      )
+      # NOTE(dsuo): Is there a more succinct / more complete test for this?
+      if not(isinstance(inp, core.ShapedArray) or isinstance(inp, core.ShapeDtypeStruct))
+      else inp for inp, in_spec in safe_zip(flat_inps, in_pspecs)
   ]
   return tree_unflatten(in_tree, out_flat)
 

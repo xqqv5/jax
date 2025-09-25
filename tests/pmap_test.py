@@ -1387,10 +1387,12 @@ class PythonPmapTest(jtu.JaxTestCase):
     f = self.pmap(lambda x: 3)
     x = jnp.arange(device_count + 1)
     if config.pmap_shmap_merge.value:
-      if jtu.device_under_test() == "cpu" or jax.device_count() > 1:
-        expected_regex = r"Sharding.*implies.*but the dimension size.*"
-      else:
-        expected_regex = r"cannot select an axis to squeeze out which has size not equal to one.*"
+      expected_regex = [
+        # NOTE(dsuo): jtu.device_under_test() == "cpu" or (jax.device_count() > 1 and not pathways).
+        r"shard_map applied.*axis sizes.*not evenly divisible.*mesh axis sizes.*",
+        r"cannot select an axis to squeeze out which has size not equal to one.*",
+      ]
+      expected_regex = "|".join(expected_regex)
     else:
       expected_regex = r"compiling computation that requires \d+ logical devices, but only \d+ XLA devices are available .*"
     self.assertRaisesRegex(ValueError, expected_regex, lambda: f(x))
