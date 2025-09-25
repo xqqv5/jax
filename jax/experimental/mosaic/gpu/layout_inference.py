@@ -1208,6 +1208,10 @@ def derive_hints_and_constraints(
     producers: list[eqns.Variable] = []
     consumers: list[eqns.Variable] = []
     for operand_or_result in operand_and_results:
+      # We can only relayout variables that are in registers.
+      if operand_or_result.memory_space != MemorySpace.REG:
+        continue
+
       if operand_or_result.type == VariableType.OPERAND:
         pr = producer_result(operand_or_result)
         producer_variable = variable_for_operand_or_result[pr]
@@ -1300,6 +1304,7 @@ def infer_layout(module: ir.Module):
   # faster.
   global_equation_system = eqns.saturate_distinct_from_splat(global_equation_system)
   assert not isinstance(global_equation_system, eqns.Unsatisfiable)
+  global_equation_system = eqns.saturate_divides_and_tiled_constraints_for_equal_vars(global_equation_system)
 
   # Attempt to find assignments that satisfy the equation system.
   solution = find_assignments_for(
